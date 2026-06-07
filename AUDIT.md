@@ -47,22 +47,30 @@ Async Context Manager `BridgeClient`; initialer Probe auf `__aenter__`; Backgrou
 
 ## 3. Sicherheit
 
-**Bind-Adresse:** `<bridge-host>:8000` (Tailscale-IP des Windows-Servers, nicht `0.0.0.0`).
+**Bind-Adresse:** `<bridge-host>:8000` (Tailscale-IP des Windows-Servers).
+Die Bridge ist ausschließlich über das private Tailscale-Netz erreichbar, nicht
+über das öffentliche Internet.
 Deployment-Kommando: `uvicorn bridge.main:app --host <bridge-host> --port 8000`.
 
 **Token-Auth:** FastAPI `HTTPBearer`-Dependency `verify_token` in `bridge/auth.py`.
 Eingebunden via `dependencies=[Depends(verify_token)]` auf jedem geschützten Router.
-Das Token wird gegen den Env-Var `ORCA_BRIDGE_TOKEN` verglichen (timing-unsicherer
-String-Vergleich — akzeptabel im LAN; für externen Einsatz auf `secrets.compare_digest` umstellen).
+Tokenpräfung mit `secrets.compare_digest` (timing-sicher).
 
 | Fehlerfall | HTTP-Status | Detail |
 |---|---|---|
 | Kein `Authorization`-Header | 401 | FastAPI HTTPBearer wirft automatisch |
 | Falsches Token | 401 | `"Invalid or missing bearer token"` |
+| Nicht-Demo-Konto | 403 | `"…not a demo account…"` (SCOPE §2.1) |
 | Korrektes Token | — | Request weiterverarbeitet |
 
 `/health` ist bewusst ohne Auth: gibt keine sensitiven Daten zurück, muss auch ohne
-Token vom Heartbeat-Client erreichbar sein.
+Token vom Heartbeat-Client erreichbar sein (und bleibt auch bei 403-Status erreichbar).
+
+**Demo-Hard-Refuse (SCOPE §2.1):** `connect()` ruft nach `mt5.initialize()` sofort
+`mt5.account_info()` auf und prüft `trade_mode == ACCOUNT_TRADE_MODE_DEMO` (= 0).
+Nicht-Demo-Konto: `mt5.shutdown()`, `_non_demo_refused = True`, kein Reconnect-Versuch.
+Alle Datenpfade rufen `require_demo()` auf — löst `NotDemoAccountError` aus, die der
+FastAPI-Exception-Handler zu HTTP 403 mappt.
 
 ---
 
@@ -99,8 +107,10 @@ Token vom Heartbeat-Client erreichbar sein.
 **Test-Abdeckung:**
 - `test_is_connected_true_when_health_ok` — `is_connected=True` nach erfolgreichem Probe.
 - `test_is_connected_false_when_bridge_unreachable` — `is_connected=False` wenn Probe fehlschlägt.
-- `test_heartbeat_logs_connection_lost` — Smoke-Test; prüft Existenz und Aufrufbarkeit von `_heartbeat_loop`.
-  (Hinweis: Log-Text "bot must halt" ist noch nicht als Assertion getestet — offener Punkt O1.)
+- `test_heartbeat_halt_on_connection_loss` — führt `_heartbeat_loop()` mit simuliertem
+  `ConnectError` aus; assertiert `is_connected=False` und ERROR-Log `"LOST"` (O1 erledigt).
+- `test_heartbeat_restored_sets_connected_true` — assertiert `is_connected=True` und
+  INFO-Log `"RESTORED"` nach Wiederverbindung.
 
 ---
 
@@ -123,13 +133,18 @@ Alle Tests laufen auf macOS; `MetaTrader5` wird via `sys.modules`-Stub in `tests
 | | `test_get_ticks_symbol_case_insensitive` | ✅ |
 | | `test_get_ticks_unsupported_symbol` | ✅ |
 | | `test_get_ticks_mt5_down` | ✅ |
+| | `test_connect_refuses_non_demo_account` | ✅ |
+| | `test_non_demo_account_refused_all_data_endpoints` | ✅ |
+| | `test_non_demo_refused_detail_mentions_demo` | ✅ |
+| | `test_health_not_blocked_by_non_demo` | ✅ |
 | | `test_order_disabled_by_default` | ✅ |
 | | `test_order_disabled_even_with_bad_body` | ✅ |
 | | `test_order_no_auth_returns_401` | ✅ |
 | `test_bridge_client.py` | `test_is_connected_true_when_health_ok` | ✅ |
 | | `test_is_connected_false_when_bridge_unreachable` | ✅ |
-| | `test_heartbeat_logs_connection_lost` | ✅ |
-| **Gesamt** | **19 / 19** | **✅** |
+| | `test_heartbeat_halt_on_connection_loss` | ✅ |
+| | `test_heartbeat_restored_sets_connected_true` | ✅ |
+| **Gesamt** | **24 / 24** | **✅** |
 
 ---
 
@@ -144,13 +159,13 @@ keine Strategie-Logik. Look-ahead-Prüfung ist Pflicht-Gate vor dem Strategie-Me
 
 | Nr. | Beschreibung | Priorität |
 |---|---|---|
-| O1 | "Bot must halt"-Verhalten im Heartbeat-Test nur strukturell geprüft, nicht als Log-Assertion | Niedrig |
-| O2 | Token-Vergleich mit `==` statt `secrets.compare_digest` — timing-safe nur im LAN akzeptabel | Niedrig |
-| O3 | `ensure_connected()` macht nur einen Reconnect-Versuch; bei dauerhaftem MT5-Ausfall kein weiterer Retry (by design, Verhalten dokumentiert) | Info |
-| O4 | Bridge-Live-Test (Mac ↔ Windows) noch nicht durchgeführt — Windows-Server-Setup ausstehend | Hoch |
+| ~~O1~~ | ~~"Bot must halt"-Verhalten nur strukturell geprüft~~ | **erledigt** — `test_heartbeat_halt_on_connection_loss` assertiert `is_connected=False` und ERROR-Log `"LOST"` |
+| ~~O2~~ | ~~Token-Vergleich mit `==` statt `secrets.compare_digest`~~ | **erledigt** — `secrets.compare_digest` in `bridge/auth.py` |
+| O3 | `ensure_connected()` macht nur einen Reconnect-Versuch; bei dauerhaftem MT5-Ausfall kein weiterer Retry (by design) | Info |
+| O4 | Bridge-Live-Test (Mac ↔ Windows über Tailscale) noch nicht durchgeführt — Windows-Server-Setup ausstehend | Hoch |
 | O5 | Datenpipeline (`data`-Subagent): H4/H1/M15/M5 OHLC + Ticks fehlt komplett | Hoch |
 | O6 | Guardrail-Schicht (`risk-execution`-Subagent): alle §3-Guardrails fehlen noch | Hoch |
-| O7 | Kein Rate-Limiting auf der Bridge (im LAN akzeptabel, dokumentiert) | Niedrig |
+| O7 | Kein Rate-Limiting auf der Bridge (über Tailscale akzeptabel, dokumentiert) | Niedrig |
 
 ---
 
@@ -158,7 +173,7 @@ keine Strategie-Logik. Look-ahead-Prüfung ist Pflicht-Gate vor dem Strategie-Me
 
 | Punkt | Status |
 |---|---|
-| MT5-Bridge läuft, authentifiziert, im LAN erreichbar | Code fertig; **Live-Deployment ausstehend (O4)** |
+| MT5-Bridge läuft, authentifiziert, über Tailscale erreichbar | Code fertig; **Live-Deployment ausstehend (O4)** |
 | Endpunkte `/account`, `/positions`, `/ticks`, `/order` (hinter §3-Guardrails) | Implementiert und getestet; `/order` ist Stub bis Guardrails freigegeben |
 | Heartbeat/Reconnect Mac-Client ↔ Bridge | Implementiert; **live noch nicht verifiziert (O4)** |
 | Datenpipeline H4/H1/M15/M5 + Ticks | **Offen (O5)** |
