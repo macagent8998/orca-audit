@@ -1,9 +1,11 @@
 # AUDIT.md — Sprint 1 · Bridge + Daten
 
-> **Status 2026-06-07:** Bridge-Code fertig und getestet. Datenpipeline
-> implementiert (Sprint 2). Guardrail-Schicht noch ausstehend. Dieses Dokument
-> wird nach Live-Verifikation und Fertigstellung der offenen Punkte dem
-> Supervisor zur Freigabe vorgelegt.
+> **Status 2026-06-07:** Bridge fertig und live verifiziert (O4 erledigt —
+> `/health` 200, `is_demo: true` über Tailscale). Datenpipeline und
+> M5-Aggregation implementiert und getestet (93/93 Tests); Look-ahead per
+> Bar-Schlusszeit abgesichert (Opus-Gate). Historientiefe live gemessen (§8a).
+> Live-Datenlauf (vollständiger Tick-Download + Konsistenzcheck M5) noch offen.
+> Guardrail-Schicht (O6) noch ausstehend. Sprint 1 **nicht abgenommen**.
 
 ---
 
@@ -276,15 +278,15 @@ wie native Bars. Konsistenzcheck gegen native M5 im Überlappungsfenster in Arbe
 | ~~O1~~ | ~~"Bot must halt"-Verhalten nur strukturell geprüft~~ | **erledigt** — `test_heartbeat_halt_on_connection_loss` assertiert `is_connected=False` und ERROR-Log `"LOST"` |
 | ~~O2~~ | ~~Token-Vergleich mit `==` statt `secrets.compare_digest`~~ | **erledigt** — `secrets.compare_digest` in `bridge/auth.py` |
 | O3 | `ensure_connected()` macht nur einen Reconnect-Versuch; bei dauerhaftem MT5-Ausfall kein weiterer Retry (by design) | Info |
-| O4 | Bridge-Live-Test (Mac ↔ Windows über Tailscale) noch nicht durchgeführt — Windows-Server-Setup ausstehend | Hoch |
-| O5 | Datenpipeline (`data`-Subagent): H4/H1/M15/M5 OHLC + Ticks | Implementiert (Sprint 2). **Live-Tiefe-Messung ausstehend — erfordert Windows-Bridge-Verbindung (O4)** |
+| ~~O4~~ | ~~Bridge-Live-Test (Mac ↔ Windows über Tailscale) noch nicht durchgeführt~~ | **erledigt** — `/health` antwortet HTTP 200 über das Tailscale-Netz; `/account` bestätigt `is_demo: true` (`trade_mode == ACCOUNT_TRADE_MODE_DEMO`); Demo-Hard-Refuse aktiv |
+| O5 | Datenpipeline (`data`-Subagent): H4/H1/M15/M5 OHLC + Ticks | Implementiert (Sprint 2). Historientiefe live gemessen (§8a). **Live-Datenlauf (vollständiger Download + Konsistenzcheck M5) noch offen** |
 | O5b | Tick→M5-Aggregation: Code fertig und getestet. **Konsistenzcheck vs. native M5 ausstehend — erfordert Live-Daten (O4)** | Hoch |
 | O6 | Guardrail-Schicht (`risk-execution`-Subagent): alle §3-Guardrails fehlen noch | Hoch |
 | O7 | Kein Rate-Limiting auf der Bridge (über Tailscale akzeptabel, dokumentiert) | Niedrig |
 
 ---
 
-## 8a. Datentiefe — Messung ausstehend
+## 8a. Datentiefe — gemessen 2026-06-07
 
 `scripts/measure_history_depth.py` ist fertig (Algorithmus: binäre Suche).
 
@@ -293,16 +295,22 @@ dann binäre Suche (Präzision ±14 Tage). Jede Probe fragt ein 30-Tages-Fenster
 (OHLC) bzw. 7-Tages-Fenster (Ticks) — breit genug, um Wochenend- und Feiertagslücken
 nicht mit dem Datenende zu verwechseln. Kein vollständiger Download der Historie.
 
-Ausführung erfordert Verbindung zur Windows-Bridge (Tailscale, O4 noch offen).
-Ergebnis wird hier eingetragen, sobald live gemessen:
+Messung durchgeführt am 2026-06-07 über das Tailscale-Netz gegen die Live-Bridge
+(RoboForex Demo, EURUSD):
 
 | Timeframe | Älteste Kerze | Tiefe (Tage) | ≥ 3 Jahre? |
 |---|---|---|---|
-| H4 | _ausstehend_ | _ausstehend_ | _ausstehend_ |
-| H1 | _ausstehend_ | _ausstehend_ | _ausstehend_ |
-| M15 | _ausstehend_ | _ausstehend_ | _ausstehend_ |
-| M5 | _ausstehend_ | _ausstehend_ | _ausstehend_ |
-| Ticks | _ausstehend_ | _ausstehend_ | _ausstehend_ |
+| H4 | ≤ 2016-06-07 (Suchtiefe-Cap > 10 J) | > 3652 | **ja** |
+| H1 | ≤ 2016-06-07 (Suchtiefe-Cap > 10 J) | > 3652 | **ja** |
+| M15 | 2022-05-26 | ~1472 | **ja** |
+| M5 (nativ) | 2025-01-29 | ~493 | **nein** |
+| Ticks | 2023-01-09 | ~1244 | **ja** |
+
+**Hinweis M5 (nativ):** Nativ-M5 erfüllt die 3-Jahres-Anforderung nicht (~493 Tage).
+Die vollständige Backtest-Abdeckung wird über Tick→M5-Aggregation hergestellt
+(SCOPE §7, Entscheidung 5 — `orca/data/aggregator.py`). Der Live-Datenlauf
+(vollständiger Tick-Download + Konsistenzcheck aggregiert vs. nativ) ist noch offen
+und der nächste Schritt (O5 / O5b).
 
 Reicht die Tiefe für 3-Jahres-Backtest nicht aus (< 1095 Tage): nur berichten,
 externe Quelle NICHT ohne Supervisor-Freigabe einführen (SCOPE §5).
@@ -313,9 +321,9 @@ externe Quelle NICHT ohne Supervisor-Freigabe einführen (SCOPE §5).
 
 | Punkt | Status |
 |---|---|
-| MT5-Bridge läuft, authentifiziert, über Tailscale erreichbar | Code fertig; **Live-Deployment ausstehend (O4)** |
+| MT5-Bridge läuft, authentifiziert, über Tailscale erreichbar | **Verifiziert** — `/health` 200, `is_demo: true` über Tailscale (O4 erledigt) |
 | Endpunkte `/account`, `/positions`, `/ticks`, `/order` (hinter §3-Guardrails) | Implementiert und getestet; `/order` ist Stub bis Guardrails freigegeben |
-| Heartbeat/Reconnect Mac-Client ↔ Bridge | Implementiert; **live noch nicht verifiziert (O4)** |
-| Datenpipeline H4/H1/M15/M5 + Ticks | **Implementiert; Live-Download ausstehend (O4)** |
+| Heartbeat/Reconnect Mac-Client ↔ Bridge | Implementiert; Verbindung live verifiziert (O4 erledigt) |
+| Datenpipeline H4/H1/M15/M5 + Ticks | Implementiert; Historientiefe live gemessen (§8a). **Live-Datenlauf noch offen** |
 | `risk-execution`-Guardrails als testbare Schicht | **Offen (O6)** |
 | AUDIT.md erzeugt und vom Supervisor freigegeben | Dieses Dokument — **Freigabe ausstehend** |
