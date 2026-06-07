@@ -1,8 +1,9 @@
 # AUDIT.md — Sprint 1 · Bridge + Daten
 
-> **Status 2026-06-02:** Bridge-Code fertig und getestet. Datenpipeline und
-> Guardrail-Schicht noch ausstehend. Dieses Dokument wird nach Live-Verifikation
-> und Fertigstellung der offenen Punkte dem Supervisor zur Freigabe vorgelegt.
+> **Status 2026-06-07:** Bridge-Code fertig und getestet. Datenpipeline
+> implementiert (Sprint 2). Guardrail-Schicht noch ausstehend. Dieses Dokument
+> wird nach Live-Verifikation und Fertigstellung der offenen Punkte dem
+> Supervisor zur Freigabe vorgelegt.
 
 ---
 
@@ -23,13 +24,34 @@
 | `bridge/routers/order.py` | `POST /order` (Stub, deaktiviert) |
 | `bridge/requirements.txt` | Server-Abhängigkeiten (FastAPI, uvicorn, pydantic-settings) |
 
+### `bridge/routers/history.py` — History Endpoints (Bridge-Seite)
+
+| Endpunkt | MT5-Aufruf | Chunking |
+|---|---|---|
+| `GET /history/ohlc?timeframe=...&from=...&to=...` | `mt5.copy_rates_range` | H4/H1: 30-Tages-Chunks; M15/M5: 7-Tages-Chunks |
+| `GET /history/ticks?from=...&to=...` | `mt5.copy_ticks_range` | 1-Tages-Chunks |
+
+Beide Endpunkte: Token-Auth, `require_demo()`, nur EURUSD, Zeiten strikt UTC.
+
+### `orca/data/` — Mac-seitige Datenpipeline
+
+| Datei | Inhalt |
+|---|---|
+| `orca/data/store.py` | Parquet-Speicher unter `data/` (gitignored); inkrementelles Merge per `drop_duplicates` |
+| `orca/data/downloader.py` | Synchroner HTTP-Client für Batch-Downloads über die Bridge |
+| `orca/data/pipeline.py` | Inkrementeller Load + Validierung + Save; `run_ohlc(tf)`, `run_ticks()` |
+| `orca/data/accessor.py` | Look-ahead-sichere API: `as_of(df, t)` + `ForwardIterator` (Opus-Gate-Pflicht) |
+| `orca/data/validator.py` | Lücken, Duplikate, Monotonie, bid≤ask; `validate_ohlc()`, `validate_ticks()` |
+
 ### `orca/bridge_client.py` — Async HTTP-Client (Mac-Seite)
 
 Async Context Manager `BridgeClient`; initialer Probe auf `__aenter__`; Background-Heartbeat-Task.
 
 ### `tests/`
 
-`conftest.py` (MT5-Stub), `test_bridge_endpoints.py` (16 Tests), `test_bridge_client.py` (3 Tests).
+`conftest.py` (MT5-Stub), `test_bridge_endpoints.py` (20 Tests), `test_bridge_client.py` (4 Tests),
+`test_bridge_history.py` (9 Tests), `test_data_accessor.py` (8 Tests),
+`test_data_validator.py` (7 Tests), `test_data_store.py` (7 Tests).
 
 ---
 
@@ -144,7 +166,38 @@ Alle Tests laufen auf macOS; `MetaTrader5` wird via `sys.modules`-Stub in `tests
 | | `test_is_connected_false_when_bridge_unreachable` | ✅ |
 | | `test_heartbeat_halt_on_connection_loss` | ✅ |
 | | `test_heartbeat_restored_sets_connected_true` | ✅ |
-| **Gesamt** | **24 / 24** | **✅** |
+| `test_bridge_history.py` | `test_get_ohlc_h4` | ✅ |
+| | `test_get_ohlc_unknown_timeframe` | ✅ |
+| | `test_get_ohlc_mt5_none` | ✅ |
+| | `test_get_ohlc_non_demo` | ✅ |
+| | `test_get_ohlc_unsupported_symbol` | ✅ |
+| | `test_get_ohlc_requires_auth` | ✅ |
+| | `test_get_ticks_history` | ✅ |
+| | `test_get_ticks_history_mt5_none` | ✅ |
+| | `test_get_ticks_history_requires_auth` | ✅ |
+| `test_data_accessor.py` | `test_as_of_returns_only_past_rows` | ✅ |
+| | `test_as_of_no_future_data_leaks` | ✅ |
+| | `test_as_of_naive_t_raises` | ✅ |
+| | `test_forward_iterator_chronological` | ✅ |
+| | `test_forward_iterator_no_rewind` | ✅ |
+| | `test_forward_iterator_exhausted` | ✅ |
+| | `test_forward_iterator_cursor_before_first_next_raises` | ✅ |
+| | `test_forward_iterator_cursor_advances` | ✅ |
+| `test_data_validator.py` | `test_validate_ohlc_clean` | ✅ |
+| | `test_validate_ohlc_high_lt_low` | ✅ |
+| | `test_validate_ohlc_duplicate_timestamps` | ✅ |
+| | `test_validate_ohlc_empty` | ✅ |
+| | `test_validate_ticks_bid_gt_ask` | ✅ |
+| | `test_validate_ticks_clean` | ✅ |
+| | `test_validate_ticks_empty` | ✅ |
+| `test_data_store.py` | `test_save_and_load_ohlc` | ✅ |
+| | `test_incremental_save_deduplicates` | ✅ |
+| | `test_latest_ohlc_time` | ✅ |
+| | `test_load_ohlc_missing_returns_none` | ✅ |
+| | `test_save_and_load_ticks` | ✅ |
+| | `test_incremental_ticks_deduplicates` | ✅ |
+| | `test_latest_tick_time_returns_none_when_empty` | ✅ |
+| **Gesamt** | **55 / 55** | **✅** |
 
 ---
 
@@ -163,9 +216,28 @@ keine Strategie-Logik. Look-ahead-Prüfung ist Pflicht-Gate vor dem Strategie-Me
 | ~~O2~~ | ~~Token-Vergleich mit `==` statt `secrets.compare_digest`~~ | **erledigt** — `secrets.compare_digest` in `bridge/auth.py` |
 | O3 | `ensure_connected()` macht nur einen Reconnect-Versuch; bei dauerhaftem MT5-Ausfall kein weiterer Retry (by design) | Info |
 | O4 | Bridge-Live-Test (Mac ↔ Windows über Tailscale) noch nicht durchgeführt — Windows-Server-Setup ausstehend | Hoch |
-| O5 | Datenpipeline (`data`-Subagent): H4/H1/M15/M5 OHLC + Ticks fehlt komplett | Hoch |
+| O5 | Datenpipeline (`data`-Subagent): H4/H1/M15/M5 OHLC + Ticks | Implementiert (Sprint 2). **Live-Tiefe-Messung ausstehend — erfordert Windows-Bridge-Verbindung (O4)** |
 | O6 | Guardrail-Schicht (`risk-execution`-Subagent): alle §3-Guardrails fehlen noch | Hoch |
 | O7 | Kein Rate-Limiting auf der Bridge (über Tailscale akzeptabel, dokumentiert) | Niedrig |
+
+---
+
+## 8a. Datentiefe — Messung ausstehend
+
+`scripts/measure_history_depth.py` ist fertig. Ausführung erfordert Verbindung zur
+Windows-Bridge (Tailscale, O4 noch offen). Sobald O4 erledigt ist, wird folgende
+Messung nachgetragen:
+
+| Timeframe | Älteste Kerze | Tiefe (Tage) |
+|---|---|---|
+| H4 | _ausstehend_ | _ausstehend_ |
+| H1 | _ausstehend_ | _ausstehend_ |
+| M15 | _ausstehend_ | _ausstehend_ |
+| M5 | _ausstehend_ | _ausstehend_ |
+| Ticks (1 Tag) | _ausstehend_ | _ausstehend_ |
+
+Reicht die Tiefe für 3-Jahres-Backtest nicht aus (< 1095 Tage): nur berichten,
+externe Quelle NICHT ohne Supervisor-Freigabe einführen (SCOPE §5).
 
 ---
 
@@ -176,6 +248,6 @@ keine Strategie-Logik. Look-ahead-Prüfung ist Pflicht-Gate vor dem Strategie-Me
 | MT5-Bridge läuft, authentifiziert, über Tailscale erreichbar | Code fertig; **Live-Deployment ausstehend (O4)** |
 | Endpunkte `/account`, `/positions`, `/ticks`, `/order` (hinter §3-Guardrails) | Implementiert und getestet; `/order` ist Stub bis Guardrails freigegeben |
 | Heartbeat/Reconnect Mac-Client ↔ Bridge | Implementiert; **live noch nicht verifiziert (O4)** |
-| Datenpipeline H4/H1/M15/M5 + Ticks | **Offen (O5)** |
+| Datenpipeline H4/H1/M15/M5 + Ticks | **Implementiert; Live-Download ausstehend (O4)** |
 | `risk-execution`-Guardrails als testbare Schicht | **Offen (O6)** |
 | AUDIT.md erzeugt und vom Supervisor freigegeben | Dieses Dokument — **Freigabe ausstehend** |
