@@ -37,11 +37,12 @@ Beide Endpunkte: Token-Auth, `require_demo()`, nur EURUSD, Zeiten strikt UTC.
 
 | Datei | Inhalt |
 |---|---|
-| `orca/data/store.py` | Parquet-Speicher unter `data/` (gitignored); inkrementelles Merge per `drop_duplicates` |
+| `orca/data/store.py` | Parquet-Speicher unter `data/` (gitignored); inkrementelles Merge; `save_m5_from_ticks()` / `load_m5_from_ticks()` |
 | `orca/data/downloader.py` | Synchroner HTTP-Client für Batch-Downloads über die Bridge |
 | `orca/data/pipeline.py` | Inkrementeller Load + Validierung + Save; `run_ohlc(tf)`, `run_ticks()` |
-| `orca/data/accessor.py` | Look-ahead-sichere API: `as_of(df, t)` + `ForwardIterator` (Opus-Gate-Pflicht) |
+| `orca/data/accessor.py` | Look-ahead-sichere API: `as_of(df, t, bar_duration)` (close-time-Semantik für OHLC, Opus-Gate-Pflicht) + `ForwardIterator` |
 | `orca/data/validator.py` | Lücken, Duplikate, Monotonie, bid≤ask; `validate_ohlc()`, `validate_ticks()` |
+| `orca/data/aggregator.py` | Deterministisches Tick→M5-Resampling (Bid-OHLC + Mid-OHLC + Spread); `aggregate_ticks_to_m5()`, `validate_m5_vs_native()` |
 
 ### `orca/bridge_client.py` — Async HTTP-Client (Mac-Seite)
 
@@ -183,6 +184,27 @@ Alle Tests laufen auf macOS; `MetaTrader5` wird via `sys.modules`-Stub in `tests
 | | `test_forward_iterator_exhausted` | ✅ |
 | | `test_forward_iterator_cursor_before_first_next_raises` | ✅ |
 | | `test_forward_iterator_cursor_advances` | ✅ |
+| | `test_m5_bar_invisible_before_close` | ✅ |
+| | `test_m5_bar_visible_at_close` | ✅ |
+| | `test_as_of_bar_duration_string_timeframe` | ✅ |
+| | `test_as_of_bar_duration_unknown_tf_raises` | ✅ |
+| | `test_h4_bar_not_visible_before_close` | ✅ |
+| | `test_forward_iterator_with_bar_duration_cursor_is_close_time` | ✅ |
+| `test_data_aggregator.py` | `test_aggregate_produces_m5_bars` | ✅ |
+| | `test_aggregate_ohlc_correctness` | ✅ |
+| | `test_aggregate_tick_volume` | ✅ |
+| | `test_aggregate_spread_preserved` | ✅ |
+| | `test_aggregate_mid_prices` | ✅ |
+| | `test_aggregate_two_m5_bars` | ✅ |
+| | `test_aggregate_missing_columns_raises` | ✅ |
+| | `test_aggregate_single_tick_bar` | ✅ |
+| | `test_aggregate_deterministic` | ✅ |
+| | `test_aggregated_m5_bar_invisible_before_close` | ✅ |
+| | `test_aggregated_m5_bar_visible_at_close` | ✅ |
+| | `test_validate_m5_identical_bars_no_flags` | ✅ |
+| | `test_validate_m5_large_deviation_flags` | ✅ |
+| | `test_validate_m5_no_overlap_returns_error` | ✅ |
+| | `test_validate_m5_reports_bar_count` | ✅ |
 | `test_data_validator.py` | `test_validate_ohlc_clean` | ✅ |
 | | `test_validate_ohlc_high_lt_low` | ✅ |
 | | `test_validate_ohlc_duplicate_timestamps` | ✅ |
@@ -197,14 +219,53 @@ Alle Tests laufen auf macOS; `MetaTrader5` wird via `sys.modules`-Stub in `tests
 | | `test_save_and_load_ticks` | ✅ |
 | | `test_incremental_ticks_deduplicates` | ✅ |
 | | `test_latest_tick_time_returns_none_when_empty` | ✅ |
-| **Gesamt** | **55 / 55** | **✅** |
+| | `test_save_and_load_m5_from_ticks` | ✅ |
+| | `test_m5_from_ticks_incremental_dedup` | ✅ |
+| `test_measure_history_depth.py` | `test_fetch_ohlc_path_and_params` | ✅ |
+| | `test_fetch_ticks_path_and_params` | ✅ |
+| | `test_fetch_ohlc_http_error_returns_none` | ✅ |
+| | `test_fetch_ohlc_network_exception_returns_none` | ✅ |
+| | `test_no_double_slash_in_url` | ✅ |
+| | `test_find_oldest_date_3y_boundary` | ✅ |
+| | `test_find_oldest_date_2y_boundary` | ✅ |
+| | `test_find_oldest_date_http_error_returns_none` | ✅ |
+| | `test_find_oldest_date_history_exceeds_cap` | ✅ |
+| | `test_find_oldest_date_precision` | ✅ |
+| | `test_measure_ohlc_no_recent_data` | ✅ |
+| | `test_measure_ohlc_detects_3y_history` | ✅ |
+| | `test_measure_ohlc_detects_short_history` | ✅ |
+| | `test_measure_ticks_no_recent_data` | ✅ |
+| | `test_measure_ticks_reports_depth` | ✅ |
+| **Gesamt** | **93 / 93** | **✅** |
 
 ---
 
 ## 7. Look-ahead-Bias
 
-Nicht zutreffend für Sprint 1. Die Bridge ist eine reine I/O-Schicht (MT5-Daten durchleiten),
-keine Strategie-Logik. Look-ahead-Prüfung ist Pflicht-Gate vor dem Strategie-Merge (SCOPE §8).
+### 7a. Allgemein (Sprint 1)
+Die Bridge ist eine reine I/O-Schicht — keine Strategie-Logik, kein Look-ahead-Risiko dort.
+
+### 7b. Bar-Schlusszeit-Semantik (Sprint 3, Opus-Gate-Pflicht)
+Ein OHLC-Bar mit Öffnungszeit T ist erst ab T + Timeframe-Dauer (= Schlusszeit) verfügbar.
+
+| Timeframe | Öffnungszeit | Schlusszeit | `bar_duration` |
+|---|---|---|---|
+| H4 | 08:00 | 12:00 | `timedelta(hours=4)` / `"H4"` |
+| H1 | 14:00 | 15:00 | `timedelta(hours=1)` / `"H1"` |
+| M15 | 14:00 | 14:15 | `timedelta(minutes=15)` / `"M15"` |
+| M5 | 14:00 | 14:05 | `timedelta(minutes=5)` / `"M5"` |
+
+**API:** `as_of(df, t, bar_duration="M5")` — Vergleich `close_time <= t`.
+Ohne `bar_duration` (Tick-/Event-Daten): `open_time <= t` (unverändertes Verhalten).
+Opus-Gate-Pflicht: **Alle** Strategie- und Backtest-Aufrufe müssen `bar_duration` setzen.
+
+**Testabdeckung:** `test_m5_bar_invisible_before_close`, `test_m5_bar_visible_at_close`,
+`test_aggregated_m5_bar_invisible_before_close`, `test_aggregated_m5_bar_visible_at_close`
++ H4/H1-Varianten → schlagen fehl, sobald Look-ahead-Schutz entfernt wird.
+
+### 7c. M5-aus-Ticks (Sprint 3)
+Tick-aggregierte M5-Bars werden über `as_of(..., bar_duration="M5")` genauso geschützt
+wie native Bars. Konsistenzcheck gegen native M5 im Überlappungsfenster in Arbeit.
 
 ---
 
@@ -217,6 +278,7 @@ keine Strategie-Logik. Look-ahead-Prüfung ist Pflicht-Gate vor dem Strategie-Me
 | O3 | `ensure_connected()` macht nur einen Reconnect-Versuch; bei dauerhaftem MT5-Ausfall kein weiterer Retry (by design) | Info |
 | O4 | Bridge-Live-Test (Mac ↔ Windows über Tailscale) noch nicht durchgeführt — Windows-Server-Setup ausstehend | Hoch |
 | O5 | Datenpipeline (`data`-Subagent): H4/H1/M15/M5 OHLC + Ticks | Implementiert (Sprint 2). **Live-Tiefe-Messung ausstehend — erfordert Windows-Bridge-Verbindung (O4)** |
+| O5b | Tick→M5-Aggregation: Code fertig und getestet. **Konsistenzcheck vs. native M5 ausstehend — erfordert Live-Daten (O4)** | Hoch |
 | O6 | Guardrail-Schicht (`risk-execution`-Subagent): alle §3-Guardrails fehlen noch | Hoch |
 | O7 | Kein Rate-Limiting auf der Bridge (über Tailscale akzeptabel, dokumentiert) | Niedrig |
 
@@ -224,17 +286,23 @@ keine Strategie-Logik. Look-ahead-Prüfung ist Pflicht-Gate vor dem Strategie-Me
 
 ## 8a. Datentiefe — Messung ausstehend
 
-`scripts/measure_history_depth.py` ist fertig. Ausführung erfordert Verbindung zur
-Windows-Bridge (Tailscale, O4 noch offen). Sobald O4 erledigt ist, wird folgende
-Messung nachgetragen:
+`scripts/measure_history_depth.py` ist fertig (Algorithmus: binäre Suche).
 
-| Timeframe | Älteste Kerze | Tiefe (Tage) |
-|---|---|---|
-| H4 | _ausstehend_ | _ausstehend_ |
-| H1 | _ausstehend_ | _ausstehend_ |
-| M15 | _ausstehend_ | _ausstehend_ |
-| M5 | _ausstehend_ | _ausstehend_ |
-| Ticks (1 Tag) | _ausstehend_ | _ausstehend_ |
+**Methode:** Rückwärts-Suche in 180-Tages-Schritten bis zur ersten leeren Antwort,
+dann binäre Suche (Präzision ±14 Tage). Jede Probe fragt ein 30-Tages-Fenster ab
+(OHLC) bzw. 7-Tages-Fenster (Ticks) — breit genug, um Wochenend- und Feiertagslücken
+nicht mit dem Datenende zu verwechseln. Kein vollständiger Download der Historie.
+
+Ausführung erfordert Verbindung zur Windows-Bridge (Tailscale, O4 noch offen).
+Ergebnis wird hier eingetragen, sobald live gemessen:
+
+| Timeframe | Älteste Kerze | Tiefe (Tage) | ≥ 3 Jahre? |
+|---|---|---|---|
+| H4 | _ausstehend_ | _ausstehend_ | _ausstehend_ |
+| H1 | _ausstehend_ | _ausstehend_ | _ausstehend_ |
+| M15 | _ausstehend_ | _ausstehend_ | _ausstehend_ |
+| M5 | _ausstehend_ | _ausstehend_ | _ausstehend_ |
+| Ticks | _ausstehend_ | _ausstehend_ | _ausstehend_ |
 
 Reicht die Tiefe für 3-Jahres-Backtest nicht aus (< 1095 Tage): nur berichten,
 externe Quelle NICHT ohne Supervisor-Freigabe einführen (SCOPE §5).
