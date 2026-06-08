@@ -1,10 +1,10 @@
 # AUDIT.md — Sprint 1 · Bridge + Daten
 
-> **Status 2026-06-07:** Bridge fertig und live verifiziert (O4 erledigt —
-> `/health` 200, `is_demo: true` über Tailscale). Datenpipeline und
-> M5-Aggregation implementiert und getestet (93/93 Tests); Look-ahead per
-> Bar-Schlusszeit abgesichert (Opus-Gate). Historientiefe live gemessen (§8a).
-> Live-Datenlauf (vollständiger Tick-Download + Konsistenzcheck M5) noch offen.
+> **Status 2026-06-08:** Bridge fertig und live verifiziert (O4 erledigt).
+> Datenpipeline und M5-Aggregation implementiert, getestet (102/102 Tests) und
+> live verifiziert: 84 Mio. EURUSD-Ticks geladen (1243 Tage), Tick→M5-
+> Konsistenzcheck bestanden (100.000 Bars, max Abw. 0,2 Pip, kein Flag).
+> Look-ahead per Bar-Schlusszeit abgesichert (Opus-Gate).
 > Guardrail-Schicht (O6) noch ausstehend. Sprint 1 **nicht abgenommen**.
 
 ---
@@ -214,6 +214,7 @@ Alle Tests laufen auf macOS; `MetaTrader5` wird via `sys.modules`-Stub in `tests
 | | `test_validate_ticks_bid_gt_ask` | ✅ |
 | | `test_validate_ticks_clean` | ✅ |
 | | `test_validate_ticks_empty` | ✅ |
+| | `test_validate_ticks_same_second_different_msc_no_false_positive` | ✅ |
 | `test_data_store.py` | `test_save_and_load_ohlc` | ✅ |
 | | `test_incremental_save_deduplicates` | ✅ |
 | | `test_latest_ohlc_time` | ✅ |
@@ -238,7 +239,15 @@ Alle Tests laufen auf macOS; `MetaTrader5` wird via `sys.modules`-Stub in `tests
 | | `test_measure_ohlc_detects_short_history` | ✅ |
 | | `test_measure_ticks_no_recent_data` | ✅ |
 | | `test_measure_ticks_reports_depth` | ✅ |
-| **Gesamt** | **93 / 93** | **✅** |
+| `test_publish_audit_leak.py` | `test_token_leak_reports_key_name` | ✅ |
+| | `test_token_leak_reports_line_number` | ✅ |
+| | `test_server_leak_reports_key_name` | ✅ |
+| | `test_bridge_url_host_leak_reports_key_name` | ✅ |
+| | `test_tailscale_ip_reports_pattern` | ✅ |
+| | `test_ts_net_hostname_reports_pattern` | ✅ |
+| | `test_clean_audit_passes` | ✅ |
+| | `test_placeholder_token_not_checked` | ✅ |
+| **Gesamt** | **102 / 102** | **✅** |
 
 ---
 
@@ -267,7 +276,7 @@ Opus-Gate-Pflicht: **Alle** Strategie- und Backtest-Aufrufe müssen `bar_duratio
 
 ### 7c. M5-aus-Ticks (Sprint 3)
 Tick-aggregierte M5-Bars werden über `as_of(..., bar_duration="M5")` genauso geschützt
-wie native Bars. Konsistenzcheck gegen native M5 im Überlappungsfenster in Arbeit.
+wie native Bars. Konsistenzcheck gegen native M5 live durchgeführt und bestanden (O5b erledigt — siehe §8).
 
 ---
 
@@ -279,10 +288,11 @@ wie native Bars. Konsistenzcheck gegen native M5 im Überlappungsfenster in Arbe
 | ~~O2~~ | ~~Token-Vergleich mit `==` statt `secrets.compare_digest`~~ | **erledigt** — `secrets.compare_digest` in `bridge/auth.py` |
 | O3 | `ensure_connected()` macht nur einen Reconnect-Versuch; bei dauerhaftem MT5-Ausfall kein weiterer Retry (by design) | Info |
 | ~~O4~~ | ~~Bridge-Live-Test (Mac ↔ Windows über Tailscale) noch nicht durchgeführt~~ | **erledigt** — `/health` antwortet HTTP 200 über das Tailscale-Netz; `/account` bestätigt `is_demo: true` (`trade_mode == ACCOUNT_TRADE_MODE_DEMO`); Demo-Hard-Refuse aktiv |
-| O5 | Datenpipeline (`data`-Subagent): H4/H1/M15/M5 OHLC + Ticks | Implementiert (Sprint 2). Historientiefe live gemessen (§8a). **Live-Datenlauf (vollständiger Download + Konsistenzcheck M5) noch offen** |
-| O5b | Tick→M5-Aggregation: Code fertig und getestet. **Konsistenzcheck vs. native M5 ausstehend — erfordert Live-Daten (O4)** | Hoch |
+| ~~O5~~ | ~~Datenpipeline: Live-Datenlauf + vollständiger Download ausstehend~~ | **erledigt** — 84.050.623 EURUSD-Ticks geladen, 2023-01-09 → 2026-06-05 (1243 Tage); Tick-Validierung sauber (kein bid>ask, monoton, kein doppelter `time_msc`); 252.264 aggregierte M5-Bars gespeichert |
+| ~~O5b~~ | ~~Konsistenzcheck aggregiert vs. nativ M5 ausstehend~~ | **erledigt** — Überlappungsfenster 2025-01-29 → 2026-06-05, **100.000 Bars verglichen** (vollständiger Inner-Join, kein Vergleichs-Cap — alle verfügbaren nativen Bars einbezogen; der native M5-Datensatz selbst ist auf ~100k Bars durch Terminal-/Abruf-Limit begrenzt, s. §8a); open/high/low: max_diff=0,000000, mean=0,000000, kein Flag; close: max_diff=0,000020 (~0,2 Pip), mean=0,000000, kein Flag; 5-Pip-Schwelle weit unterschritten, kein systematischer Drift; **Einschätzung: aggregierte M5 == native M5 (Bid) im Rahmen der Toleranz**. 3-Jahres-Abdeckung nicht betroffen — sie kommt aus Ticks (kein Bar-Cap, ab 2023-01-09) |
 | O6 | Guardrail-Schicht (`risk-execution`-Subagent): alle §3-Guardrails fehlen noch | Hoch |
 | O7 | Kein Rate-Limiting auf der Bridge (über Tailscale akzeptabel, dokumentiert) | Niedrig |
+| ~~O8~~ | `validate_ticks()` meldete ~48 Mio. False-Positive-Duplikate (Sekundenauflösung von `time`; mehrere Ticks/Sekunde ist normales EURUSD-Verhalten) | **erledigt** — Validator nutzt jetzt `time_msc` (ms-Präzision) als Dedup- und Monotonie-Key, konsistent mit `save_ticks()`. Regressionstest: `test_validate_ticks_same_second_different_msc_no_false_positive` |
 
 ---
 
@@ -303,14 +313,25 @@ Messung durchgeführt am 2026-06-07 über das Tailscale-Netz gegen die Live-Brid
 | H4 | ≤ 2016-06-07 (Suchtiefe-Cap > 10 J) | > 3652 | **ja** |
 | H1 | ≤ 2016-06-07 (Suchtiefe-Cap > 10 J) | > 3652 | **ja** |
 | M15 | 2022-05-26 | ~1472 | **ja** |
-| M5 (nativ) | 2025-01-29 | ~493 | **nein** |
+| M5 (nativ) | 2025-01-29 | ~493 | **nein** (nativ) — ✅ via Tick→M5 |
 | Ticks | 2023-01-09 | ~1244 | **ja** |
 
-**Hinweis M5 (nativ):** Nativ-M5 erfüllt die 3-Jahres-Anforderung nicht (~493 Tage).
-Die vollständige Backtest-Abdeckung wird über Tick→M5-Aggregation hergestellt
-(SCOPE §7, Entscheidung 5 — `orca/data/aggregator.py`). Der Live-Datenlauf
-(vollständiger Tick-Download + Konsistenzcheck aggregiert vs. nativ) ist noch offen
-und der nächste Schritt (O5 / O5b).
+**M5-Abdeckung via Tick→M5-Aggregation (O5/O5b erledigt):**
+Nativ-M5 reicht nur ~493 Tage zurück. **Ursache: Terminal-/Abruf-Limit (~100k Bars).**
+Probe 2026-06-08 — Anfrage M5 für 1246 Tage (2023-01-09 → heute, theoretisch ~256k Bars)
+lieferte 100.117 Bars ab 2025-01-29 — die älteste Bar bleibt unabhängig vom Anfragefenster
+konstant, ein eindeutiges Cap-Muster. Gleiches Muster bei M15: 100k / 96 Bars/Tag × 7/5
+≈ 1459 Tage → älteste Kerze 2022-05-26 (~1471 Tage). `terminal_info().maxbars` ist über die
+Bridge nicht auslesbar (kein Endpunkt ohne Bridge-Umbau); ein höheres TERMINAL_MAXBARS
+würde das native Validierungsfenster verlängern, ist für die 3-Jahres-Abdeckung aber
+nicht erforderlich.
+
+**3-Jahres-Abdeckung nicht betroffen** — sie kommt aus Broker-Ticks (kein Bar-Cap):
+- 84.050.623 Ticks geladen, 2023-01-09 → 2026-06-05
+- 252.264 aggregierte M5-Bars, selber Zeitraum
+- Konsistenzcheck gegen native M5 im Fenster 2025-01-29 → 2026-06-05 bestanden:
+  100.000 verglichene Bars (vollständiger Inner-Join, kein Vergleichs-Cap),
+  max Abweichung close 0,000020 (~0,2 Pip), kein systematischer Drift, kein geflaggtes Feld.
 
 Reicht die Tiefe für 3-Jahres-Backtest nicht aus (< 1095 Tage): nur berichten,
 externe Quelle NICHT ohne Supervisor-Freigabe einführen (SCOPE §5).
@@ -324,6 +345,6 @@ externe Quelle NICHT ohne Supervisor-Freigabe einführen (SCOPE §5).
 | MT5-Bridge läuft, authentifiziert, über Tailscale erreichbar | **Verifiziert** — `/health` 200, `is_demo: true` über Tailscale (O4 erledigt) |
 | Endpunkte `/account`, `/positions`, `/ticks`, `/order` (hinter §3-Guardrails) | Implementiert und getestet; `/order` ist Stub bis Guardrails freigegeben |
 | Heartbeat/Reconnect Mac-Client ↔ Bridge | Implementiert; Verbindung live verifiziert (O4 erledigt) |
-| Datenpipeline H4/H1/M15/M5 + Ticks | Implementiert; Historientiefe live gemessen (§8a). **Live-Datenlauf noch offen** |
+| Datenpipeline H4/H1/M15/M5 + Ticks | **Live verifiziert** — 84 Mio. Ticks geladen, M5-Konsistenzcheck bestanden (§8a, O5/O5b erledigt) |
 | `risk-execution`-Guardrails als testbare Schicht | **Offen (O6)** |
 | AUDIT.md erzeugt und vom Supervisor freigegeben | Dieses Dokument — **Freigabe ausstehend** |
