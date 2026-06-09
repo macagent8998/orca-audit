@@ -1,11 +1,11 @@
 # AUDIT.md — Sprint 1 · Bridge + Daten
 
-> **Status 2026-06-08:** Bridge fertig und live verifiziert (O4 erledigt).
-> Datenpipeline und M5-Aggregation implementiert, getestet (102/102 Tests) und
-> live verifiziert: 84 Mio. EURUSD-Ticks geladen (1243 Tage), Tick→M5-
-> Konsistenzcheck bestanden (100.000 Bars, max Abw. 0,2 Pip, kein Flag).
-> Look-ahead per Bar-Schlusszeit abgesichert (Opus-Gate).
-> Guardrail-Schicht (O6) noch ausstehend. Sprint 1 **nicht abgenommen**.
+> **Status 2026-06-09:** Sprint 1 **abgenommen** (Opus-Supervisor-Freigabe).
+> Bridge live verifiziert (O4); Datenpipeline + M5-Aggregation live verifiziert
+> (O5/O5b, Tick→M5-Konsistenz bestanden); risk-execution-Guardrails als hart
+> erzwungene, fail-closed Schicht (O6, inkl. Missing-State-Fix); 159/159 Tests;
+> Look-ahead per Bar-Schlusszeit abgesichert. `ORDERS_ENABLED=false` — kein
+> Live-Handel. Nächste Phasen: `strategy` (härtestes Look-ahead-Gate), `backtest`.
 
 ---
 
@@ -50,11 +50,27 @@ Beide Endpunkte: Token-Auth, `require_demo()`, nur EURUSD, Zeiten strikt UTC.
 
 Async Context Manager `BridgeClient`; initialer Probe auf `__aenter__`; Background-Heartbeat-Task.
 
+### `orca/risk/` — Guardrail-Schicht (Mac-Seite)
+
+| Datei | Inhalt |
+|---|---|
+| `orca/risk/models.py` | Datenklassen: `OrderRequest`, `AccountState`, `DayState`, `Decision`, `Action` (Enum) |
+| `orca/risk/config.py` | SCOPE.md-Parser → `GuardrailConfig` (frozen dataclass); fail-closed, kein Default |
+| `orca/risk/guardrails.py` | Reine Entscheidungsfunktion `evaluate_order()`; 10 Guardrails in Reihenfolge; I/O-frei, deterministisch |
+| `orca/risk/state.py` | `DayState`-Persistenz (JSON, `state/` gitignored); `load_or_init_day_state()` / `save_day_state()`; Neustart-sicher |
+| `orca/risk/kill_switch.py` | `check_kill_switch(path)` (rein); `do_flat(bridge_client)` (async, gegen Mock getestet; live-inaktiv bis Freigabe) |
+| `orca/risk/execution.py` | `submit_order()`; `ORDERS_ENABLED`-Gate (Env-Var, default `false`); kein Live-Aufruf ohne Freigabe |
+| `orca/risk/decision_log.py` | Strukturiertes JSON-Lines-Log jeder Entscheidung; lokal, gitignored |
+
 ### `tests/`
 
 `conftest.py` (MT5-Stub), `test_bridge_endpoints.py` (20 Tests), `test_bridge_client.py` (4 Tests),
-`test_bridge_history.py` (9 Tests), `test_data_accessor.py` (8 Tests),
-`test_data_validator.py` (7 Tests), `test_data_store.py` (7 Tests).
+`test_bridge_history.py` (9 Tests), `test_data_accessor.py` (14 Tests — inkl. Look-ahead-Tests),
+`test_data_aggregator.py` (15 Tests), `test_data_validator.py` (7 Tests), `test_data_store.py` (9 Tests),
+`test_measure_history_depth.py` (15 Tests), `test_publish_audit_leak.py` (8 Tests),
+`test_risk_config.py` (4 Tests), `test_risk_guardrails.py` (29 Tests),
+`test_risk_state.py` (12 Tests), `test_risk_kill_switch.py` (7 Tests),
+`test_risk_execution.py` (5 Tests — inkl. ORDERS_ENABLED-Gate).
 
 ---
 
@@ -247,7 +263,64 @@ Alle Tests laufen auf macOS; `MetaTrader5` wird via `sys.modules`-Stub in `tests
 | | `test_ts_net_hostname_reports_pattern` | ✅ |
 | | `test_clean_audit_passes` | ✅ |
 | | `test_placeholder_token_not_checked` | ✅ |
-| **Gesamt** | **102 / 102** | **✅** |
+| `test_risk_config.py` | `test_load_config_from_real_scope` | ✅ |
+| | `test_config_missing_file_raises` | ✅ |
+| | `test_config_corrupt_value_raises` | ✅ |
+| | `test_config_is_frozen` | ✅ |
+| `test_risk_guardrails.py` | `test_kill_switch_active_halts` | ✅ |
+| | `test_kill_switch_inactive_continues` | ✅ |
+| | `test_bridge_disconnected_halts` | ✅ |
+| | `test_not_demo_halts` | ✅ |
+| | `test_wrong_symbol_rejects` | ✅ |
+| | `test_missing_sl_rejects` | ✅ |
+| | `test_missing_tp_rejects` | ✅ |
+| | `test_rr_exactly_min_accepts` | ✅ |
+| | `test_rr_below_min_rejects` | ✅ |
+| | `test_risk_per_trade_below_limit_accepts` | ✅ |
+| | `test_risk_per_trade_above_limit_rejects` | ✅ |
+| | `test_equity_zero_rejects` | ✅ |
+| | `test_max_positions_zero_accepts` | ✅ |
+| | `test_max_positions_reached_rejects` | ✅ |
+| | `test_trades_below_daily_max_accepts` | ✅ |
+| | `test_trades_at_daily_max_rejects` | ✅ |
+| | `test_daily_loss_below_stop_accepts` | ✅ |
+| | `test_daily_loss_at_stop_halts` | ✅ |
+| | `test_circuit_breaker_active_halts` | ✅ |
+| | `test_day_state_none_halts` | ✅ |
+| | `test_fail_closed_all_good_accepts` | ✅ |
+| | `test_determinism` | ✅ |
+| `test_risk_state.py` | `test_fresh_init_no_file` (→ Bootstrap-Pfad) | ✅ |
+| | `test_init_overwrites_existing_file` | ✅ |
+| *(O6-Fix)* | `test_missing_file_raises_state_missing_error` | ✅ |
+| | `test_missing_file_does_not_create_any_file` | ✅ |
+| | `test_restart_same_day_loads` | ✅ |
+| | `test_new_day_resets` | ✅ |
+| | `test_rollover_requires_existing_file` | ✅ |
+| | `test_corrupt_file_raises` | ✅ |
+| | `test_empty_file_raises` | ✅ |
+| | `test_missing_key_raises` | ✅ |
+| | `test_trades_count_persists` | ✅ |
+| | `test_halt_persists_across_restart` | ✅ |
+| `test_risk_kill_switch.py` | `test_no_kill_file_returns_false` | ✅ |
+| | `test_kill_file_exists_returns_true` | ✅ |
+| | `test_kill_switch_check_order_priority` | ✅ |
+| | `test_kill_switch_beats_high_risk_reject` | ✅ |
+| | `test_do_flat_closes_all_positions` | ✅ |
+| | `test_do_flat_no_positions_no_close` | ✅ |
+| | `test_do_flat_get_positions_error_does_not_raise` | ✅ |
+| `test_risk_guardrails.py` | `test_circuit_breaker_survives_restart` | ✅ |
+| *(Nachreichung)* | `test_trade_counter_survives_restart` | ✅ |
+| | `test_corrupt_state_evaluate_halts` | ✅ |
+| *(O6-Fix)* | `test_missing_state_evaluate_halts` | ✅ |
+| | `test_bridge_down_beats_all_reject_checks` | ✅ |
+| | `test_rejected_order_does_not_mutate_day_state` | ✅ |
+| | `test_risk_exactly_at_limit_accepts` | ✅ |
+| `test_risk_execution.py` | `test_orders_enabled_false_is_default` | ✅ |
+| | `test_reject_not_submitted` | ✅ |
+| | `test_halt_not_submitted` | ✅ |
+| | `test_accept_orders_disabled_not_submitted` | ✅ |
+| | `test_accept_orders_enabled_calls_bridge` | ✅ |
+| **Gesamt** | **159 / 159** | **✅** |
 
 ---
 
@@ -290,7 +363,7 @@ wie native Bars. Konsistenzcheck gegen native M5 live durchgeführt und bestande
 | ~~O4~~ | ~~Bridge-Live-Test (Mac ↔ Windows über Tailscale) noch nicht durchgeführt~~ | **erledigt** — `/health` antwortet HTTP 200 über das Tailscale-Netz; `/account` bestätigt `is_demo: true` (`trade_mode == ACCOUNT_TRADE_MODE_DEMO`); Demo-Hard-Refuse aktiv |
 | ~~O5~~ | ~~Datenpipeline: Live-Datenlauf + vollständiger Download ausstehend~~ | **erledigt** — 84.050.623 EURUSD-Ticks geladen, 2023-01-09 → 2026-06-05 (1243 Tage); Tick-Validierung sauber (kein bid>ask, monoton, kein doppelter `time_msc`); 252.264 aggregierte M5-Bars gespeichert |
 | ~~O5b~~ | ~~Konsistenzcheck aggregiert vs. nativ M5 ausstehend~~ | **erledigt** — Überlappungsfenster 2025-01-29 → 2026-06-05, **100.000 Bars verglichen** (vollständiger Inner-Join, kein Vergleichs-Cap — alle verfügbaren nativen Bars einbezogen; der native M5-Datensatz selbst ist auf ~100k Bars durch Terminal-/Abruf-Limit begrenzt, s. §8a); open/high/low: max_diff=0,000000, mean=0,000000, kein Flag; close: max_diff=0,000020 (~0,2 Pip), mean=0,000000, kein Flag; 5-Pip-Schwelle weit unterschritten, kein systematischer Drift; **Einschätzung: aggregierte M5 == native M5 (Bid) im Rahmen der Toleranz**. 3-Jahres-Abdeckung nicht betroffen — sie kommt aus Ticks (kein Bar-Cap, ab 2023-01-09) |
-| O6 | Guardrail-Schicht (`risk-execution`-Subagent): alle §3-Guardrails fehlen noch | Hoch |
+| ~~O6~~ | ~~Guardrail-Schicht: alle §3-Guardrails fehlen noch~~ | **erledigt** — `orca/risk/` implementiert; 10 Guardrails (Prüfreihenfolge a–j, erste Verletzung gewinnt); `evaluate_order()` deterministisch + I/O-frei; `DayState` Neustart-persistent; Kill-Switch + `do_flat()` gegen Mock getestet; `submit_order()` mit `ORDERS_ENABLED`-Gate (default `false`); Missing-State fail-closed (O6-Fix); 42+10+5 Tests (159/159 gesamt). Bekannte Einschränkungen: s. §8b |
 | O7 | Kein Rate-Limiting auf der Bridge (über Tailscale akzeptabel, dokumentiert) | Niedrig |
 | ~~O8~~ | `validate_ticks()` meldete ~48 Mio. False-Positive-Duplikate (Sekundenauflösung von `time`; mehrere Ticks/Sekunde ist normales EURUSD-Verhalten) | **erledigt** — Validator nutzt jetzt `time_msc` (ms-Präzision) als Dedup- und Monotonie-Key, konsistent mit `save_ticks()`. Regressionstest: `test_validate_ticks_same_second_different_msc_no_false_positive` |
 
@@ -338,6 +411,93 @@ externe Quelle NICHT ohne Supervisor-Freigabe einführen (SCOPE §5).
 
 ---
 
+## 8b. O6 — Guardrail-Schicht (`orca/risk/`)
+
+### 10 Guardrails — Schwellen aus SCOPE.md §3
+
+Alle Schwellen werden beim Start einmalig aus SCOPE.md geparst (`load_guardrail_config()`).
+Kein hartkodierter Zahlenwert in `guardrails.py`. Erste Verletzung gewinnt (fail-closed).
+
+| Check | Guardrail | Schwelle | Aktion | Grenzfall-Test |
+|---|---|---|---|---|
+| a | Kill-Switch | Datei `./KILL` vorhanden | HALT | `test_kill_switch_active_halts` |
+| b | Bridge-Heartbeat | `is_connected=False` | HALT | `test_bridge_disconnected_halts` |
+| c | Demo-Flag | `is_demo=False` | HALT | `test_not_demo_halts` |
+| d | Symbol-Whitelist | Symbol ∉ `["EURUSD"]` | REJECT | `test_wrong_symbol_rejects` |
+| e | Pflicht-SL/TP | SL oder TP = `None` | REJECT | `test_missing_sl_rejects`, `test_missing_tp_rejects` |
+| f | Mindest-RR | RR < 2,0 | REJECT | `test_rr_exactly_min_accepts` (2,0 → ACCEPT), `test_rr_below_min_rejects` (1,9 → REJECT) |
+| g | Max. Risiko/Trade | `risk_frac` > 0,5 % | REJECT | `test_risk_per_trade_below_limit_accepts` (0,49 % → ACCEPT), `test_risk_per_trade_above_limit_rejects` (0,51 % → REJECT) |
+| h | Max. gleichzeitige Positionen | offene Positionen ≥ 1 | REJECT | `test_max_positions_reached_rejects` |
+| i | Max. Trades / Tag | Trades heute ≥ 3 | REJECT | `test_trades_at_daily_max_rejects` |
+| j | Tages-Verlust-Stopp | kumulierter realisierter Verlust ≤ −1,5 % der SOD-Equity | HALT | `test_daily_loss_at_stop_halts` (−1,5 % → HALT), `test_daily_loss_below_stop_accepts` (−1,4 % → ACCEPT) |
+
+Circuit Breaker aktiv (vorheriger HALT): `test_circuit_breaker_active_halts`.
+Kein `DayState` (fail-closed): `test_day_state_none_halts`.
+
+### Drei Definitionen (festgenagelt durch Docstrings + Tests)
+
+**Risiko/Trade:** Equity-Anteil, der bei SL-Treffer verloren ginge, berechnet VOR Orderstellung.
+Formel: `risk_usd = |entry − SL| × 100.000 × Lots`; `risk_frac = risk_usd / account.equity`.
+Referenz: `account.equity`. Equity = 0 oder SL = entry → fail-closed REJECT.
+
+**Trade heute:** Ein ACCEPTierter Order, der zu einer Positionseröffnung führte.
+Abgelehnte Orders zählen NICHT. Quelle: `DayState.trades_opened_today` (persistenter Tageszähler).
+
+**Tagesverlust:** Kumulierter realisierter (geschlossener) P&L seit 00:00 UTC;
+Referenz = `DayState.start_of_day_equity`. Floating/unrealisierter P&L geht NICHT in den
+Trigger ein — als bekannte Einschränkung dokumentiert (s. unten).
+
+### DayState-Persistenz (`state/day_state.json`, gitignored)
+
+Zwei getrennte Pfade (nach O6-Fix):
+
+| Pfad | Funktion | Wann aufgerufen |
+|---|---|---|
+| Lad-Pfad | `load_day_state()` | Run-Loop |
+| Bootstrap-Pfad | `init_day_state()` | Init-CLI / Erst-Einrichtung |
+
+`load_day_state()` — Verhalten:
+
+| Szenario | Verhalten |
+|---|---|
+| File fehlt | `StateMissingError` → Caller muss HALT setzen (fail-closed) |
+| File korrupt/unlesbar | `StateCorruptError` → Caller muss HALT setzen (fail-closed) |
+| File für heute | State laden, Zähler und Circuit Breaker bleiben erhalten |
+| File für anderen Tag (Rollover) | Frischer State für heute; erlaubt weil Vortagesdatei vorhanden |
+
+`init_day_state()` — immer frischer Null-State; darf NICHT vom Run-Loop aufgerufen werden.
+
+Felder: `date_utc`, `start_of_day_equity`, `trades_opened_today`, `realized_pnl_today`, `halted_until`.
+`halted_until = heute` → Circuit Breaker aktiv für den Rest des Tages; nächster Tag → Reset.
+
+### O6-Fix: Missing-State fail-closed (2026-06-09)
+
+**Befund:** `load_or_init_day_state()` behandelte ein fehlendes State-File als Reset
+(frischer Null-State), nicht als Fehler. Ein mid-day gelöschtes File hätte
+`trades_opened_today=0` und `halted_until=None` ergeben — Circuit Breaker und
+Tageszähler wären lautlos zurückgesetzt worden.
+
+**Fix:** Lade- und Bootstrap-Pfad getrennt. `load_day_state()` wirft `StateMissingError`
+wenn kein File existiert — identisches fail-closed-Verhalten wie bei `StateCorruptError`.
+Frische Nullwerte nur über explizites `init_day_state()` (Bootstrap-CLI), das der
+Run-Loop nie selbst aufruft. Rollover (vorhandene Vortagesdatei, date < today) bleibt
+im Lade-Pfad erlaubt. 5 neue Tests (4 in `test_risk_state.py`, 1 in `test_risk_guardrails.py`).
+
+### Bekannte Einschränkungen
+
+- **Floating-Loss nicht im Trigger:** Nur realisierter P&L löst den Tages-Verlust-Stopp aus.
+  Ein großer offener Float-Verlust ist erst nach Positionsschluss im Zähler sichtbar.
+  Accepted risk (Demo-Kontext; keine Positionen ohne SL erlaubt, Risiko dadurch begrenzt).
+- **`do_flat()` live-inaktiv:** Gebaut und gegen gemockte Bridge getestet.
+  Wird erst aktiv, wenn `ORDERS_ENABLED=true` gesetzt ist (Supervisor-Freigabe erforderlich).
+- **`ORDERS_ENABLED=false`:** Kein echter Order-Call. `/order`-Stub bleibt 503.
+  Aktivierung nur nach ausdrücklicher Freigabe (SCOPE §3 / CLAUDE.md §Berechtigungen).
+- **Run-Loop-Integration (Strategie-/Execution-Phase):** MUSS `StateMissingError` und
+  `StateCorruptError` fangen und HALTEN — nie frisch initialisieren. Wird am
+  Strategie-/Execution-Gate per Test verifiziert (Bypass-Schutz für den Missing-State-Fix).
+
+---
+
 ## 9. SCOPE.md §9 — Definition of Done Sprint 1
 
 | Punkt | Status |
@@ -346,5 +506,5 @@ externe Quelle NICHT ohne Supervisor-Freigabe einführen (SCOPE §5).
 | Endpunkte `/account`, `/positions`, `/ticks`, `/order` (hinter §3-Guardrails) | Implementiert und getestet; `/order` ist Stub bis Guardrails freigegeben |
 | Heartbeat/Reconnect Mac-Client ↔ Bridge | Implementiert; Verbindung live verifiziert (O4 erledigt) |
 | Datenpipeline H4/H1/M15/M5 + Ticks | **Live verifiziert** — 84 Mio. Ticks geladen, M5-Konsistenzcheck bestanden (§8a, O5/O5b erledigt) |
-| `risk-execution`-Guardrails als testbare Schicht | **Offen (O6)** |
-| AUDIT.md erzeugt und vom Supervisor freigegeben | Dieses Dokument — **Freigabe ausstehend** |
+| `risk-execution`-Guardrails als testbare Schicht | **Implementiert** — `orca/risk/`; 10 Guardrails; `evaluate_order()` deterministisch; `ORDERS_ENABLED=false` (kein Live-Call); Missing-State fail-closed (O6-Fix); 159 Tests (O6 + O6-Fix erledigt, s. §8b) |
+| AUDIT.md erzeugt und vom Supervisor freigegeben | **Freigegeben** — Opus-Supervisor 2026-06-09 (Meilenstein Bridge + Daten + Guardrails) |
