@@ -3,9 +3,13 @@
 > **Status 2026-06-09:** Sprint 1 **abgenommen** (Opus-Supervisor-Freigabe).
 > Bridge live verifiziert (O4); Datenpipeline + M5-Aggregation live verifiziert
 > (O5/O5b, Tick→M5-Konsistenz bestanden); risk-execution-Guardrails als hart
-> erzwungene, fail-closed Schicht (O6, inkl. Missing-State-Fix); 159/159 Tests;
+> erzwungene, fail-closed Schicht (O6, inkl. Missing-State-Fix); 178/178 Tests;
 > Look-ahead per Bar-Schlusszeit abgesichert. `ORDERS_ENABLED=false` — kein
-> Live-Handel. Nächste Phasen: `strategy` (härtestes Look-ahead-Gate), `backtest`.
+> Live-Handel.
+>
+> **Laufend (2026-06-10):** Strategy-Phase Step 1 — Primitive + Marktstruktur gebaut
+> (`orca/strategy/`); 229/229 Tests; I1/I2/I3/I5 bestanden. Opus-Gate (Look-ahead)
+> vor Merge — noch ausstehend.
 
 ---
 
@@ -70,7 +74,8 @@ Async Context Manager `BridgeClient`; initialer Probe auf `__aenter__`; Backgrou
 `test_measure_history_depth.py` (15 Tests), `test_publish_audit_leak.py` (8 Tests),
 `test_risk_config.py` (4 Tests), `test_risk_guardrails.py` (29 Tests),
 `test_risk_state.py` (12 Tests), `test_risk_kill_switch.py` (7 Tests),
-`test_risk_execution.py` (5 Tests — inkl. ORDERS_ENABLED-Gate).
+`test_risk_execution.py` (5 Tests — inkl. ORDERS_ENABLED-Gate),
+`test_scope_watchdog.py` (19 Tests — Build-Zeit-Tooling, alle Modell-Calls gemockt).
 
 ---
 
@@ -320,7 +325,26 @@ Alle Tests laufen auf macOS; `MetaTrader5` wird via `sys.modules`-Stub in `tests
 | | `test_halt_not_submitted` | ✅ |
 | | `test_accept_orders_disabled_not_submitted` | ✅ |
 | | `test_accept_orders_enabled_calls_bridge` | ✅ |
-| **Gesamt** | **159 / 159** | **✅** |
+| `test_scope_watchdog.py` | `test_new_test_file_is_not_drift` | ✅ |
+| *(Scope-Watchdog)* | `test_guardrails_bugfix_is_not_drift` | ✅ |
+| | `test_second_symbol_is_drift` | ✅ |
+| | `test_llm_in_runtime_is_drift` | ✅ |
+| | `test_orders_enabled_true_is_drift` | ✅ |
+| | `test_missing_key_skips_gracefully` | ✅ |
+| | `test_missing_key_does_not_crash` | ✅ |
+| | `test_garbage_response_is_unclear` | ✅ |
+| | `test_partial_json_missing_drift_key_is_unclear` | ✅ |
+| | `test_model_exception_is_unclear` | ✅ |
+| | `test_api_key_not_in_json_report` | ✅ |
+| | `test_api_key_not_in_error_message` | ✅ |
+| | `test_audit_only_diff_skips_model` | ✅ |
+| | `test_removes_audit_hunk` | ✅ |
+| | `test_empty_after_filter_if_only_audit` | ✅ |
+| | `test_non_audit_diff_unchanged` | ✅ |
+| | `test_parses_clean_json` | ✅ |
+| | `test_parses_json_in_markdown_fence` | ✅ |
+| | `test_missing_drift_key_is_error` | ✅ |
+| **Gesamt** | **178 / 178** | **✅** |
 
 ---
 
@@ -495,6 +519,113 @@ im Lade-Pfad erlaubt. 5 neue Tests (4 in `test_risk_state.py`, 1 in `test_risk_g
 - **Run-Loop-Integration (Strategie-/Execution-Phase):** MUSS `StateMissingError` und
   `StateCorruptError` fangen und HALTEN — nie frisch initialisieren. Wird am
   Strategie-/Execution-Gate per Test verifiziert (Bypass-Schutz für den Missing-State-Fix).
+
+---
+
+## 8c. Scope-Watchdog (`orca/tools/scope_watchdog.py`, SCOPE §8)
+
+### Was es ist
+
+Leichtgewichtiger Drift-Melder: liest ein git-Diff + `SCOPE.md` und fragt ein
+**günstiges Modell** (`claude-haiku-4-5-20251001`, konfigurierbar), ob das Diff
+Funktionalität/Abhängigkeiten/Symbole/Konten einführt, die über `SCOPE.md`
+hinausgehen. Ausgabe: strukturiertes JSON + Exit-Code + menschenlesbare Zeile.
+
+### Was es ausdrücklich NICHT ist
+
+- **Kein Gate, kein Veto.** Blockiert nichts, committet nichts, schreibt nichts.
+- **Kein Ersatz für das Opus-Gate.** Opus entscheidet über Freigaben; der Watchdog meldet nur.
+- **Nie im Trading-Loop.** Reines Bauzeit-/CI-Tooling; nicht von `orca.risk`, `orca.strategy`
+  oder `orca.data` importiert.
+
+### Wie er läuft
+
+```bash
+python scripts/scope_watchdog.py                    # letzter Commit
+python scripts/scope_watchdog.py --range HEAD~3..HEAD
+python scripts/scope_watchdog.py --diff file.diff
+```
+
+| Exit-Code | Bedeutung |
+|---|---|
+| 0 | OK — kein Drift erkannt |
+| 1 | Scope-Drift erkannt — Mensch + Opus müssen prüfen |
+| 2 | Unklar — kein Key / Modell nicht erreichbar / Antwort unparsebar |
+
+Fail-safe: nie still grün. Exit 2 bei jedem Zweifel. AUDIT.md-Hunks werden
+vor dem API-Call herausgefiltert (keine False-Positives durch Doku-Commits).
+API-Key aus `ANTHROPIC_API_KEY`-Env-Var; nie geloggt, nie im Report.
+Optionaler lokaler Report: `reports/scope_watchdog_last.json` (gitignored).
+
+### Modell und Kosten
+
+Default: `claude-haiku-4-5-20251001` — günstigstes verfügbares Modell (SCOPE §7).
+Konfigurierbar via `--model`. Max. 512 Output-Tokens pro Aufruf.
+Kein echtes Modell in den Tests — ausschließlich gemockte Clients.
+
+### Tests (`tests/test_scope_watchdog.py`, 19 Tests)
+
+| Klasse | Was getestet wird |
+|---|---|
+| `TestInScopeDiff` | Neuer Test / Bugfix → drift=false, Exit 0 |
+| `TestOutOfScopeDiff` | GBPUSD / LLM im Runtime / `ORDERS_ENABLED=true` → drift=true, Exit 1 |
+| `TestNoApiKey` | Kein Key → skip, Exit 2, kein Crash |
+| `TestUnparseableResponse` | Garbage / fehlendes Feld / Exception → Exit 2 |
+| `TestSecretHandling` | API-Key nie im JSON-Report oder Fehlermeldung |
+| `TestAuditMdFilter` | AUDIT.md-only-Diff → kein Modell-Call, Exit 0 |
+| `TestFilterDiff` | Unit-Tests `_filter_diff()` |
+| `TestParseResponse` | Unit-Tests `_parse_response()` inkl. Markdown-Fences |
+
+---
+
+## 8d. Strategy-Phase Step 1 — Primitive + Marktstruktur (2026-06-10)
+
+### Modul-Aufteilung (`orca/strategy/`)
+
+| Datei | Inhalt |
+|---|---|
+| `primitives.py` | Konstanten (`PIP`, `SWING_K`, `EQ_TOL`, `OB_LOOKBACK`, `FVG_MIN`); `slice_ohlc_as_of()` (bar_duration keyword-only required); `validate_ohlc()` |
+| `structure.py` | `SwingPoint`, `StructureEvent`, `MarketStructure`; `find_swings()` (K=2 Fraktal, +K-Lag erzwungen); `compute_market_structure()` (CHoCH/BOS Zustandsmaschine) |
+| `liquidity.py` | `LiquidityLevel`, `EqualCluster`, `Sweep`; `find_liquidity_levels()`, `find_equal_clusters()` (EQ_TOL=1 pip), `detect_sweeps()` (Wick-basiert + Close-Return) |
+| `zones.py` | `OrderBlock`, `FairValueGap`, `DealingRange`; `find_order_blocks()` (letzte Gegenkerze in OB_LOOKBACK), `find_fvg()` (3-Bar-Gap, ≥ FVG_MIN), `apply_mitigation()` (FVG 50 % Fill, OB First Entry), `find_dealing_range()` |
+| `__init__.py` | Re-Export aller öffentlichen Symbole |
+
+**Begründung der Aufteilung:** `primitives` hat keine internen Abhängigkeiten → immer zuerst importierbar. `structure` baut auf `primitives`. `liquidity` braucht nur `SwingPoint` aus `structure`. `zones` braucht `MarketStructure` + `SwingPoint`. Keine zirkulären Importe.
+
+### Look-ahead-Absicherung
+
+**+K-Bestätigungs-Lag (I2):** `find_swings()` iteriert nur über `range(K, n-K)`. Ein Swing bei Index i erfordert die rechten Nachbarn `i+1..i+K` — die sind nur vorhanden, wenn `i+K ≤ n-1`, also `n ≥ i+K+1`. Das erzwingt der Loop unabhängig vom Caller-Slicing.
+
+**`slice_ohlc_as_of()` (I1):** `bar_duration` ist keyword-only ohne Default. Weglassen → `TypeError` via Python-Sprachgarantie. Die Funktion filtert auf `close_time = open_time + bar_duration ≤ t`, nicht auf `open_time ≤ t`.
+
+**Deterministisch (I3):** Alle Datenklassen `frozen=True`; alle Funktionen pure (kein I/O, kein Zustand). Gleiche Eingabe → gleiche Ausgabe per Definition.
+
+**Master-Look-ahead (I5):** `slice_ohlc_as_of(df, t, ...)` liefert für identisches `df[:t+1]` immer den gleichen Slice — Mutationen in `df[t+1:]` haben keinen Effekt. Alle Primitive sind reine Funktionen über den gelieferten Slice. Getestet mit dramatischen Preisverfälschungen nach t und mit zusätzlich angehängten Bars.
+
+### Tests (`tests/test_strategy_step1.py`, 51 Tests)
+
+| Klasse | Was getestet wird |
+|---|---|
+| `TestBarDurationRequired` (I1) | TypeError ohne bar_duration; positionaler Aufruf ebenfalls abgefangen; String-Timeframe; unbekannter TF |
+| `TestSwingLag` (I2) | Self-Check a: Slice ≤ i+K-1 → kein Swing; Self-Check b: Slice = i+K → Swing da; SL-Lag analog |
+| `TestSwingBasic` | Zu kurze Serie; korrekte Anzahl SH/SL; Float-Preis; letzten K Bars nie zurückgegeben |
+| `TestMarketStructure` | Neutral (kein Break); bullish CHoCH; bearish CHoCH; events-Tuple vollständig; fehlende Spalte → ValueError |
+| `TestLiquidity` | SH→buy_side, SL→sell_side; Equal-Cluster innerhalb / außerhalb Toleranz; Sell-side-Sweep detektiert; kein Sweep ohne Close-Return; Level kann sich nicht selbst sweepen |
+| `TestFVG` | Bullish/Bearish erkannt; unter FVG_MIN verworfen; kein FVG bei Überlappung |
+| `TestMitigation` | FVG mitigated bei 50 %-Fill; nicht mitigated wenn Preis fern bleibt; OB bei First Entry mitigated; already-mitigated bleibt |
+| `TestDealingRange` | Basis-Range; Premium; Discount; kein Result bei fehlenden Swings; neueste Swings verwendet |
+| `TestOrderBlocks` | Bullish OB gefunden; origin_bar < break_bar; kein Event → keine OBs |
+| `TestSliceOhlcAsOf` | Nicht-geschlossene Bars ausgeschlossen; Reset-Index; String-Timeframe |
+| `TestDeterminism` (I3) | Swings, MarketStructure, FVG, DealingRange — gleiche Eingabe → gleiche Ausgabe |
+| `TestLookAhead` (I5) | Mutation nach t; Append nach t; drei Timeframes (M5/M15/H4) |
+
+### Bekannte Einschränkungen / Vorbehalte
+
+- `compute_market_structure()` verfolgt nur den **letzten** bestätigten Swing pro Typ als aktives Referenzniveau. Wenn zwei Swings dieselbe Bar-Confirmation haben, gewinnt der mit dem höheren Index.
+- `find_dealing_range()` verwendet die **aktuellsten** Swings nach Index, nicht zwingend die strukturell relevantesten. Für Step 2 (Signale) kann eine kontextbasierte Filterung notwendig sein.
+- Noch kein Integration-Test gegen echte EURUSD-Historiendaten; solcher Test ist für den Opus-Gate-Review (Look-ahead-Prüfung vor Merge) vorgesehen.
+
+**Nächster Step:** Strategy Step 2 — Signalregelkaskade H4→H1→M15→M5 (erst nach Opus-Gate-Review dieses Steps).
 
 ---
 
