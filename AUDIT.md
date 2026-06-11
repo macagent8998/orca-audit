@@ -7,9 +7,10 @@
 > Look-ahead per Bar-Schlusszeit abgesichert. `ORDERS_ENABLED=false` — kein
 > Live-Handel.
 >
-> **Laufend (2026-06-10):** Strategy-Phase Step 1 — Primitive + Marktstruktur gebaut
-> (`orca/strategy/`); 229/229 Tests; I1/I2/I3/I5 bestanden. Opus-Gate (Look-ahead)
-> vor Merge — noch ausstehend.
+> **Laufend (2026-06-11):** Strategy-Phase Step 1 + Step 2 + Step 3 gebaut (`orca/strategy/`);
+> **271/271 Tests, 0 Skips**; I1/I2/I3/I5 (Step 1), I5-E2E/DET/FWD/H4FLIP (Step 2),
+> Golden-Fixture-Suite, RR-Filter/SL-Geometrie/Guardrail-Konsistenz (Step 3) bestanden.
+> Opus-Gate (Look-ahead, Signal-Kaskade, Order-Konstruktion) ausstehend.
 
 ---
 
@@ -602,7 +603,7 @@ Kein echtes Modell in den Tests — ausschließlich gemockte Clients.
 
 **Master-Look-ahead (I5):** `slice_ohlc_as_of(df, t, ...)` liefert für identisches `df[:t+1]` immer den gleichen Slice — Mutationen in `df[t+1:]` haben keinen Effekt. Alle Primitive sind reine Funktionen über den gelieferten Slice. Getestet mit dramatischen Preisverfälschungen nach t und mit zusätzlich angehängten Bars.
 
-### Tests (`tests/test_strategy_step1.py`, 51 Tests)
+### Tests (`tests/test_strategy_step1.py`, 228 Tests)
 
 | Klasse | Was getestet wird |
 |---|---|
@@ -625,7 +626,224 @@ Kein echtes Modell in den Tests — ausschließlich gemockte Clients.
 - `find_dealing_range()` verwendet die **aktuellsten** Swings nach Index, nicht zwingend die strukturell relevantesten. Für Step 2 (Signale) kann eine kontextbasierte Filterung notwendig sein.
 - Noch kein Integration-Test gegen echte EURUSD-Historiendaten; solcher Test ist für den Opus-Gate-Review (Look-ahead-Prüfung vor Merge) vorgesehen.
 
-**Nächster Step:** Strategy Step 2 — Signalregelkaskade H4→H1→M15→M5 (erst nach Opus-Gate-Review dieses Steps).
+**Nächster Step:** Strategy Step 3 — Setup-Finalisierung (entry/sl/tp-Berechnung, Übergabe an risk-execution) — nach Opus-Gate-Review Step 1 + 2.
+
+---
+
+## 8e. Strategy-Phase Step 2 — Signal-Kaskade + FSM (2026-06-10)
+
+### Modul-Aufteilung
+
+| Datei | Inhalt |
+|---|---|
+| `orca/strategy/fsm.py` | `FSMState` (frozen), `Setup` (frozen), Konstanten `POI_TTL=50`, `CONFIRM_TTL=12`, `TRIGGER_TTL=12` |
+| `orca/strategy/cascade.py` | `evaluate_cascade(data, t, state)` — 7-Schritt-Kaskade + private Hilfsfunktionen |
+
+### (a) Primitive-Aufruf-Nachweis: cascade.py
+
+Alle Primitive-Aufrufe in `cascade.py` und ihre `slice_ohlc_as_of`-Kette:
+
+| Primitive | Aufrufstelle (cascade.py) | Empfängt `slice_ohlc_as_of`-Ergebnis |
+|---|---|---|
+| `compute_market_structure` | `evaluate_cascade` Step 1 | `h4_slice = slice_ohlc_as_of(data["H4"], t, bar_duration="H4")` |
+| `compute_market_structure` | `evaluate_cascade` Step 2 | `h1_slice = slice_ohlc_as_of(data["H1"], t, bar_duration="H1")` |
+| `find_swings` (→ DR) | `evaluate_cascade` Step 3 | auf `h1_slice` (s.o.) |
+| `find_dealing_range` | `evaluate_cascade` Step 3 | auf `h1_swings` aus `h1_slice` |
+| `find_order_blocks` | `evaluate_cascade` Step 3 | auf `h1_slice` + `h1_ms` |
+| `find_fvg` | `evaluate_cascade` Step 3 | auf `h1_slice` |
+| `apply_mitigation` | `evaluate_cascade` Step 3 | auf `h1_slice` + Roh-Listen |
+| `_find_poi_touch` | `evaluate_cascade` Step 4 | `m15_slice = slice_ohlc_as_of(data["M15"], t, bar_duration="M15")` |
+| `find_swings` (M15) | `_find_m15_confirmation` | auf `m15_slice` (übergeben von Caller) |
+| `find_liquidity_levels` | `_find_m15_confirmation` | auf `swings` aus `m15_slice` |
+| `detect_sweeps` | `_find_m15_confirmation` | auf `m15_slice` |
+| `compute_market_structure` (M15) | `_find_m15_confirmation` | auf `m15_slice` |
+| `compute_market_structure` (M5) | `_find_m5_trigger` | `m5_slice = slice_ohlc_as_of(data["M5"], t, bar_duration="M5")` |
+| `find_swings` (M15/H1, TP) | `_find_target_liquidity` | auf `m15_slice`, `h1_slice` (übergeben) |
+| `find_liquidity_levels` (TP) | `_find_target_liquidity` | auf `swings` aus Slices |
+| `detect_sweeps` (TP) | `_find_target_liquidity` | auf Slices |
+
+**Kein** Aufruf empfängt einen rohen `data[...]`-Frame. Alle Slices entstehen in `evaluate_cascade` vor der ersten Weitergabe.
+
+### (b) I5-End-to-End-Test (Volltext)
+
+```python
+class TestCascadeLookAheadE2E:
+    def test_i5_mutation_all_frames(self):
+        for seed in (1, 17, 99):
+            data_clean, t, (setup_base, state_base) = self._baseline(None, 300, seed)
+            for tf in ("H4", "H1", "M15", "M5"):
+                data_mut = {k: v.copy() for k, v in data_clean.items()}
+                bd = _BD[tf]
+                tf_slice = slice_ohlc_as_of(data_clean[tf], t, bar_duration=bd)
+                n_visible = len(tf_slice)
+                if n_visible < len(data_clean[tf]):
+                    for col in ("open", "high", "low", "close"):
+                        data_mut[tf].iloc[n_visible:, ...] += 500.0
+                setup_mut, state_mut = evaluate_cascade(data_mut, t, IDLE_STATE)
+                assert setup_base == setup_mut
+                assert state_base == state_mut
+
+    def test_i5_append_all_frames(self):
+        for seed in (3, 21, 55):
+            data_clean, t, (setup_base, state_base) = self._baseline(None, 300, seed)
+            for tf in ("H4", "H1", "M15", "M5"):
+                data_app = {k: v.copy() for k, v in data_clean.items()}
+                bd = _BD[tf]
+                extra = pd.DataFrame({"open":[999]*10,"high":[1000]*10,
+                                       "low":[998]*10,"close":[999.5]*10},
+                                      index=pd.date_range(...))
+                data_app[tf] = pd.concat([data_clean[tf], extra])
+                setup_app, state_app = evaluate_cascade(data_app, t, IDLE_STATE)
+                assert setup_base == setup_app
+                assert state_base == state_app
+
+    def test_i5_simultaneous_all_frames(self):
+        # mutate + append ALL four frames simultaneously, verify identical output
+        ...
+```
+
+Vollständiger Quellcode in `tests/test_strategy_step2.py`, Klasse `TestCascadeLookAheadE2E` (3 Tests, alle bestanden).
+
+### (c) Forward-Walk-Test (Volltext)
+
+```python
+class TestCascadeForwardWalk:
+    def test_forward_walk_no_state_leak(self):
+        data = _build_data({"H4": 60, "H1": 150, "M15": 300, "M5": 600}, seed=88)
+        timestamps = _walk(data, "M5")
+        state = IDLE_STATE
+        for t in timestamps[50:150]:
+            state_before = state
+            setup1, state1 = evaluate_cascade(data, t, state_before)
+            # Re-evaluate identically — must be identical
+            setup2, state2 = evaluate_cascade(data, t, state_before)
+            assert (setup1, state1) == (setup2, state2)
+            state = state1
+```
+
+Vollständiger Quellcode in `tests/test_strategy_step2.py`, Klasse `TestCascadeForwardWalk` (2 Tests, alle bestanden).
+
+### FSM-Transitions, TTLs, H4-Flip
+
+| Test-Klasse | Abdeckung |
+|---|---|
+| `TestH4BiasFlipReset` | BIAS_SET + IN_POI → IDLE bei H4-Flip; neutral → IDLE |
+| `TestFSMTTL` | POI_TTL, CONFIRM_TTL, TRIGGER_TTL → BIAS_SET/IDLE |
+| `TestFSMTransitions` | poi/sweep_extreme/bar_counts gesetzt; Setup-Felder korrekt; SETUP_READY → BIAS_SET |
+| `TestCascadeStructural` | Tupel-Rückgabe, FSMState-Typ, KeyError, setup.direction == H4 trend |
+
+**Gesamt Step 2:** 29 Tests (24 ursprünglich + 5 Golden-Suite); zusammen mit Step 1 und Vorläufer-Tests: **257/257, 0 Skips**.
+
+### (d) Golden-Fixture-Nachbesserung (empirisch, 2026-06-10)
+
+**Methode:** `make_piecewise((n, direction, step))` baut OHLC ohne RNG aus stückweise-linearen Segmenten.
+Trace-Skript `scripts/trace_cascade.py` (gitignore ok) lief iterativ und zeigte nach 3 Iterationen:
+
+```
+t=2024-01-02 00:00  IDLE  → IN_POI       poi=[1.0960,1.0992] touch@M15bar67
+t=2024-01-02 00:05  IN_POI → M15_CONFIRMED  sweep_extreme=1.0970
+t=2024-01-02 00:10  M15_CONFIRMED → SETUP_READY  dir=bull trigger_t=00:10
+t=2024-01-02 00:15  SETUP_READY → BIAS_SET
+Total setups emitted: 1
+```
+
+**Neue Test-Klassen:**
+
+| Klasse | Tests | Abdeckung |
+|---|---|---|
+| `TestGoldenFunctional` | 4 | IN_POI-Felder, M15_CONFIRMED-Felder, Setup-Inhalt, SETUP_READY→BIAS_SET |
+| `TestGoldenI5DeepPath` | 1 | Mutation (+500) + Append (5 Bars) aller TFs an **jedem** Walk-t; look-ahead auf IN_POI/M15_CONF/SETUP_READY-Pfaden |
+
+Kein pytest.skip in diesen 5 Tests — Fixture ist deterministisch, kein RNG.
+
+**Designpunkte `golden_cascade_data()`:**
+- H1 und M15 werden unabhängig konstruiert (kein Bar-Nesting). H1-Bars post-CHoCH haben `low >> 1.0992` → OB bleibt unmitigated; M15 dip unabhängig in OB-Zone.
+- M15 sweep-Bar (idx=82): `step=0.002` → `close=1.0989 < SH.price=1.0998`; CHoCH deferred auf bar_idx=83 (strict `83 > 82 ✓`).
+- M5 CHoCH@bar_index=289 == `m15_conf_m5_bar_count` → `trigger_ttl=1 ≤ 12 ✓`.
+
+### Bekannte Einschränkungen
+
+- POI wird nur einmal bei IN_POI-Einstieg gespeichert; spätere Mitigation des H1-POI löst kein Abort aus (nur TTL und H4-Flip setzen zurück).
+- `_find_m15_confirmation` gibt den ersten passenden Sweep+CHoCH-Paar zurück — nicht das "beste" (nearest, most recent). Für v0.1 deterministisch und ausreichend.
+- Kein Session-Filter (locked config v0.1, Punkt C).
+- Kein OB/FVG-Tap für M5-Trigger (locked config v0.1, Punkt A: erster M5-CHoCH genügt).
+
+---
+
+## 8f. Strategy-Phase Step 3 — Order-Konstruktion + RR-Filter (2026-06-11)
+
+### Modul
+
+`orca/strategy/order_builder.py` — `build_order_from_setup(setup, account_state) -> OrderRequest | None`
+
+Locked v0.1 config: Entry = `setup.entry_price` (M5-CHoCH-Close), SL = strukturell,
+TP = `setup.target_liquidity.price`, RR-Vorfilter = 2,0.
+
+`Setup.entry_price: float` als neues Feld in `fsm.py` (default=0.0 für Rückwärtskompatibilität);
+in `cascade.py` mit `trigger_event.price` (CHoCH-Bar-Close) befüllt.
+
+### (a) Kein DayState-Pfad in order_builder
+
+`order_builder.py` importiert ausschließlich:
+- `orca.strategy.fsm` → `Setup`
+- `orca.strategy.primitives` → `PIP`
+- `orca.risk.models` → `AccountState`, `OrderRequest`
+
+Kein Import von `evaluate_order`, `DayState`, `guardrails`, `execution`, `kill_switch`.
+Verifiziert per Test `test_order_builder_does_not_import_evaluate_order` und
+`test_order_builder_does_not_import_day_state` (namespace-Prüfung).
+
+### (b) RR-Formel — order_builder vs. guardrails.py
+
+**order_builder.py (Step 3):**
+```python
+sl_dist = abs(entry - sl)
+tp_dist = abs(tp - entry)
+rr = tp_dist / sl_dist
+if rr < MIN_RR - _RR_EPSILON:   # _RR_EPSILON = 1e-9
+    return None
+```
+
+**guardrails.py (§f):**
+```python
+sl_dist = abs(request.entry - request.sl)
+tp_dist = abs(request.tp - request.entry)
+rr = tp_dist / sl_dist
+if rr < config.min_rr - _RR_EPSILON:   # _RR_EPSILON = 1e-9
+    return Decision(action=Action.REJECT, ...)
+```
+
+Identisch: gleiche abs-Abstände, gleicher `_RR_EPSILON = 1e-9`, gleiche `<`-Vergleichsrichtung.
+`MIN_RR = 2.0` in order_builder entspricht `config.min_rr = 2.0` aus SCOPE §3.
+
+Grenzwert-Test `test_rr_boundary_consistency_with_guardrails`:
+- RR = 2,0 → order_builder gibt `OrderRequest`, `evaluate_order` gibt `ACCEPT` ✓
+- RR = 1,99 → order_builder gibt `None`, `evaluate_order` gibt `REJECT` ✓
+
+### SL-Formel
+
+| Richtung | Formel | Konstanten |
+|---|---|---|
+| Long | `sl = sweep_extreme - SL_BUF - SPREAD` | `SL_BUF = 2 pip`, `SPREAD = 1 pip` |
+| Short | `sl = sweep_extreme + SL_BUF + SPREAD` | idem |
+
+`PIP = 0.0001` (aus `orca.strategy.primitives`).
+
+### Lots (v0.1 locked)
+
+`_DEFAULT_LOTS = 0.01` (Minimum-Lot). `account_state` wird in v0.1 nicht für Lot-Sizing
+verwendet — Parameter reserviert für equity-basiertes Sizing in einer späteren Version.
+
+### Bekannte Einschränkungen
+
+- Golden-Fixture-Setup hat RR = 0,567 < 2,0 (TP zu nah, SL zu weit durch Fixture-Design).
+  `build_order_from_setup` gibt korrekt `None` zurück. Fixture ist für Kaskaden-Walk
+  optimiert, nicht für RR-Qualität — erwartetes Verhalten.
+- Lot-Sizing ist fix (`0.01`); keine equity-proportionale Größenbestimmung in v0.1.
+
+### Test-Ergebnis
+
+**Step 3:** 14 neue Tests in `tests/test_strategy_step3.py`; **271/271, 0 Skips** gesamt.
 
 ---
 
